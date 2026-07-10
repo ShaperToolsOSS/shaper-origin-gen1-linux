@@ -2,6 +2,12 @@
 // Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
 // Copyright (C) 2008 Juergen Beisert
 
+/*
+ *	Modification history:
+ *       - Julian Sourivongs <julians@shapertools.com> Implement device_wait_for_state and set_cs
+ * 			Based on code written by Stephen Street.
+ */
+
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
@@ -27,7 +33,10 @@
 
 #define DRIVER_NAME "spi_imx"
 
-static bool use_dma = true;
+#define	CS_ACTIVE	1	/* normally nCS, active low */
+#define	CS_INACTIVE	0
+
+static bool use_dma = false;
 module_param(use_dma, bool, 0644);
 MODULE_PARM_DESC(use_dma, "Enable usage of DMA when available (default)");
 
@@ -124,6 +133,9 @@ struct spi_imx_data {
 	u32 wml;
 	struct completion dma_rx_completion;
 	struct completion dma_tx_completion;
+
+	/* Slave hooks */
+	int (*device_wait_for_state)(struct spi_device *spi, bool ready);
 
 	const struct spi_imx_devtype_data *devtype_data;
 };
@@ -229,6 +241,13 @@ static int spi_imx_bytes_per_word(const int bits_per_word)
 	else
 		return 4;
 }
+
+void spi_imx_hook_device_wait_for_state(struct spi_controller *controller, int (*device_wait_for_state)(struct spi_device *spi, bool ready))
+{
+	struct spi_imx_data *spi_imx = spi_controller_get_devdata(controller);
+	spi_imx->device_wait_for_state = device_wait_for_state;
+}
+EXPORT_SYMBOL_GPL(spi_imx_hook_device_wait_for_state);
 
 static bool spi_imx_can_dma(struct spi_controller *controller, struct spi_device *spi,
 			 struct spi_transfer *transfer)
@@ -1116,6 +1135,20 @@ static const struct of_device_id spi_imx_dt_ids[] = {
 };
 MODULE_DEVICE_TABLE(of, spi_imx_dt_ids);
 
+static void spi_imx_chipselect(struct spi_device *spi, bool is_active)
+{
+	int active = is_active != CS_INACTIVE;
+	int dev_is_lowactive = !(spi->mode & SPI_CS_HIGH);
+
+	if (spi->mode & SPI_NO_CS) {
+		pr_info("spi-imx-master: no chipselect\n");
+		return;
+	}
+
+	gpiod_set_raw_value(spi->cs_gpiod[0], dev_is_lowactive ^ active);
+	//pr_info("spi-imx-master: %s completed against gpio %d\n", __func__, spi->cs_gpio);
+}
+
 static void spi_imx_set_burst_len(struct spi_imx_data *spi_imx, int n_bits)
 {
 	u32 ctrl;
@@ -1610,6 +1643,18 @@ static int spi_imx_pio_transfer_target(struct spi_device *spi,
 	return ret;
 }
 
+static int spi_imx_device_wait_for_state(struct spi_device *spi, bool ready)
+{
+	struct spi_imx_data *spi_imx = spi_controller_get_devdata(spi->controller);
+
+	/* Wait until mcu is ready before starting transaction */
+	/* Allow slave to control flow */
+	if (spi_imx->device_wait_for_state) {
+		return spi_imx->device_wait_for_state(spi, ready);
+	}
+	return 0;
+}
+
 static int spi_imx_transfer_one(struct spi_controller *controller,
 				struct spi_device *spi,
 				struct spi_transfer *transfer)
@@ -1750,7 +1795,9 @@ static int spi_imx_probe(struct platform_device *pdev)
 	else
 		controller->num_chipselect = 3;
 
+	controller->set_cs = spi_imx_chipselect;
 	controller->transfer_one = spi_imx_transfer_one;
+	controller->device_wait_for_state = spi_imx_device_wait_for_state;
 	controller->setup = spi_imx_setup;
 	controller->prepare_message = spi_imx_prepare_message;
 	controller->unprepare_message = spi_imx_unprepare_message;

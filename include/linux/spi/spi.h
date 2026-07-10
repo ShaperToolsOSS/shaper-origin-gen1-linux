@@ -3,6 +3,12 @@
  * Copyright (C) 2005 David Brownell
  */
 
+/*
+ *	Modification history:
+ *       - Julian Sourivongs <julians@shapertools.com> Add device_wait_for_state.
+ * 			Based on code written by Stephen Street.
+ */
+
 #ifndef __LINUX_SPI_H
 #define __LINUX_SPI_H
 
@@ -724,7 +730,11 @@ struct spi_controller {
 			       struct spi_message *message);
 	int (*unprepare_message)(struct spi_controller *ctlr,
 				 struct spi_message *message);
-	int (*target_abort)(struct spi_controller *ctlr);
+	int (*device_wait_for_state)(struct spi_device *spi, bool busy);
+	union {
+		int (*slave_abort)(struct spi_controller *ctlr);
+		int (*target_abort)(struct spi_controller *ctlr);
+	};
 
 	/*
 	 * These hooks are for drivers that use a generic implementation
@@ -1694,5 +1704,8 @@ spi_transfer_is_last(struct spi_controller *ctlr, struct spi_transfer *xfer)
 {
 	return list_is_last(&xfer->transfer_list, &ctlr->cur_msg->transfers);
 }
+
+// function for hooking up a ready callback
+void spi_imx_hook_device_wait_for_state(struct spi_controller *controller, int (*device_wait_for_state)(struct spi_device *spi, bool busy));
 
 #endif /* __LINUX_SPI_H */

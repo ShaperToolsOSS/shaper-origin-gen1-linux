@@ -1,0 +1,7 @@
+menu "Shaper Tools Drivers"
+
+source "drivers/shapertools/coltrane/mcu/Kconfig"
+source "drivers/shapertools/coltrane/external/pixiepro-spread-spectrum/Kconfig"
+source "drivers/shapertools/coltrane/usbh1-oc-alert/Kconfig"
+
+endmenu

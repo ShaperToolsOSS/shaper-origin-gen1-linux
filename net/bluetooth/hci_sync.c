@@ -3128,6 +3128,19 @@ int hci_update_passive_scan_sync(struct hci_dev *hdev)
 	if (hdev->discovery.state != DISCOVERY_STOPPED)
 		return 0;
 
+	/* XW(2025/1/22): Take the lock for the whole hci_dev in order to make
+	 * the hci_discovery_filter_clear call atomic and resolve a race with
+	 * start_service_discovery. This current function is called by
+	 * hci_cmd_sync_work after taking hdev->req_lock, so care must be taken
+	 * taking any additional mutexes in order to avoid a deadlock. Elsewhere
+	 * in this file, this lock call carries the comment "This is safe as
+	 * long as there is no command send while the lock is held," suggesting
+	 * the same concern. There's also a comment "Avoid potential lockdep
+	 * warnings from the *_flush() calls by ensuring the workqueue is empty
+	 * up front" which shouldn't come up because hci_discovery_filter_clear
+	 * wouldn't be calling *_flush(). */
+	hci_dev_lock(hdev);
+
 	/* Reset RSSI and UUID filters when starting background scanning
 	 * since these filters are meant for service discovery only.
 	 *
@@ -3136,6 +3149,8 @@ int hci_update_passive_scan_sync(struct hci_dev *hdev)
 	 * filter list. So it is safe to just reset them here.
 	 */
 	hci_discovery_filter_clear(hdev);
+
+	hci_dev_unlock(hdev);
 
 	bt_dev_dbg(hdev, "ADV monitoring is %s",
 		   hci_is_adv_monitoring(hdev) ? "on" : "off");

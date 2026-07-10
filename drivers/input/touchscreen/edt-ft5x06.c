@@ -74,6 +74,8 @@
 #define EDT_RAW_DATA_RETRIES		100
 #define EDT_RAW_DATA_DELAY		1000 /* usec */
 
+#define CTRL_REGISTER_ADDR		0x86 // Used for dis/enabling automode switching
+
 #define EDT_DEFAULT_NUM_X		1024
 #define EDT_DEFAULT_NUM_Y		1024
 
@@ -1350,6 +1352,16 @@ static int edt_ft5x06_ts_probe(struct i2c_client *client)
 		return error;
 
 	edt_ft5x06_ts_prepare_debugfs(tsdata, dev_driver_string(&client->dev));
+
+	// Disable auto mode switching, to keep from falling asleep
+	error = regmap_write(tsdata->regmap, CTRL_REGISTER_ADDR, 0x00);
+	if (error) {
+		dev_err(&client->dev,
+		"EDT FT5x06 failed to write CTRL register, error %d"
+		" , automode not disabled\n", error);
+	} else {
+		dev_info(&client->dev, "EDT FT5x06 automode disabled\n");
+	}
 
 	dev_dbg(&client->dev,
 		"EDT FT5x06 initialized: IRQ %d, WAKE pin %d, Reset pin %d.\n",

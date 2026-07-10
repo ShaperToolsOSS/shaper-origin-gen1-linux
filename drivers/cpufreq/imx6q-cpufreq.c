@@ -361,7 +361,7 @@ static int imx6q_cpufreq_probe(struct platform_device *pdev)
 			PTR_ERR(soc_reg) == -EPROBE_DEFER ||
 			PTR_ERR(pu_reg) == -EPROBE_DEFER) {
 		ret = -EPROBE_DEFER;
-		dev_dbg(cpu_dev, "regulators not ready, defer\n");
+		dev_info(cpu_dev, "regulators not ready, defer\n");
 		goto put_reg;
 	}
 	if (IS_ERR(arm_reg) || IS_ERR(soc_reg)) {

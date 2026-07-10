@@ -19,7 +19,9 @@
 
 #include "cpufreq_governor.h"
 
-#define CPUFREQ_DBS_MIN_SAMPLING_INTERVAL	(2 * TICK_NSEC / NSEC_PER_USEC)
+/* SHAPER SW-8724: Increase default ondemand sampling rate to reduce CPU frequency thrash */
+/* #define CPUFREQ_DBS_MIN_SAMPLING_INTERVAL	(2 * TICK_NSEC / NSEC_PER_USEC) */
+#define CPUFREQ_DBS_MIN_SAMPLING_INTERVAL	(16 * TICK_NSEC / NSEC_PER_USEC)
 
 static DEFINE_PER_CPU(struct cpu_dbs_info, cpu_dbs);
 

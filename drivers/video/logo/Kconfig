@@ -70,4 +70,8 @@ config LOGO_SUPERH_CLUT224
 	depends on SUPERH
 	default y
 
+config LOGO_SHAPER_MONO
+       bool "Shaper black and white Linux logo"
+       default y
+
 endif # LOGO

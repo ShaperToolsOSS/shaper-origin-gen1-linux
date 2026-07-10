@@ -161,6 +161,7 @@ config CRYPTO_DEV_FSL_CAAM_PRNG_API
 
 config CRYPTO_DEV_FSL_CAAM_BLOB_GEN
 	bool
+	default y
 
 config CRYPTO_DEV_FSL_CAAM_RNG_TEST
 	bool "Test caam rng"

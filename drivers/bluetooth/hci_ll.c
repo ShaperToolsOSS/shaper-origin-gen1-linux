@@ -624,10 +624,10 @@ static int ll_setup(struct hci_uart *hu)
 	do {
 		/* Reset the Bluetooth device */
 		gpiod_set_value_cansleep(lldev->enable_gpio, 0);
-		msleep(5);
+		msleep(200);
 		gpiod_set_value_cansleep(lldev->enable_gpio, 1);
-		mdelay(100);
-		err = serdev_device_wait_for_cts(serdev, true, 200);
+		msleep(1000);
+		err = serdev_device_wait_for_cts(serdev, true, 1000);
 		if (err) {
 			bt_dev_err(hu->hdev, "Failed to get CTS");
 			return err;

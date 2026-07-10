@@ -377,6 +377,16 @@ __ca9_errata:
 	mcrlt	p15, 0, r0, c15, c0, 1		@ write diagnostic register
 1:
 #endif
+#ifdef CONFIG_ARM_ERRATA_761320
+	mrcle	p15, 0, r0, c15, c0, 1		@ read diagnostic register
+	orrle	r0, r0, #1 << 21		@ set bit #21
+	mcrle	p15, 0, r0, c15, c0, 1		@ write diagnostic register
+#endif
+#ifdef CONFIG_ARM_ERRATA_845369
+	mrcle	p15, 0, r0, c15, c0, 1		@ read diagnostic register
+	orrle	r0, r0, #1 << 22		@ set bit #22
+	mcrle	p15, 0, r0, c15, c0, 1		@ write diagnostic register
+#endif
 	b	__errata_finish
 
 __ca15_errata:

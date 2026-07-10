@@ -1026,6 +1026,7 @@ imx_media_capture_device_init(struct device *dev, struct v4l2_subdev *src_sd,
 	vq->lock = &priv->mutex;
 	vq->min_queued_buffers = 2;
 	vq->dev = priv->dev;
+	vq->allow_cache_hints = 1;
 
 	ret = vb2_queue_init(vq);
 	if (ret) {

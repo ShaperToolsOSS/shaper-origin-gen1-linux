@@ -4,6 +4,15 @@
 // Copyright (C) 2005 David Brownell
 // Copyright (C) 2008 Secret Lab Technologies Ltd.
 
+/*
+ *	Modification history:
+ *       - Julian Sourivongs <julians@shapertools.com> Add device_wait_for_state calls
+ * 			to spi_transfer_one_message.
+ *
+ *       - Julian Sourivongs <julians@shapertools.com> Add logic to guarantee a minimum
+ * 			cs low time to prevent unintentionally triggering MCU spi reset.
+ */
+
 #include <linux/acpi.h>
 #include <linux/cache.h>
 #include <linux/clk/clk-conf.h>
@@ -34,6 +43,17 @@
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-mem.h>
 #include <uapi/linux/sched/types.h>
+
+/*
+ * Defines the maximum cs low pulse that will trigger an MCU spi reset (in microseconds)
+ * defined in mcu-firmware.
+ */
+#define RESET_TIME_US 7
+
+/*
+ * Defines the buffer ammount we use to prevent accidentally triggering an MCU spi reset (in microseconds)
+ */
+#define RESET_TO_NORMAL_BUFFER_US 3
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/spi.h>
@@ -1600,6 +1620,17 @@ void spi_transfer_cs_change_delay_exec(struct spi_message *msg,
 EXPORT_SYMBOL_GPL(spi_transfer_cs_change_delay_exec);
 
 /*
+ * spi_ensure_minimum_cs_low_time - Make sure that we do not accidentally trigger
+ * MCU spi reset with too short a cs active pulse
+ */
+static inline void spi_ensure_minimum_cs_low_time(u64 elapsed_ns) {
+	u64 minimum_cs_time_ns = NSEC_PER_USEC * (RESET_TIME_US + RESET_TO_NORMAL_BUFFER_US);
+	if (elapsed_ns < minimum_cs_time_ns) {
+		_spi_transfer_delay_ns(minimum_cs_time_ns - elapsed_ns);
+	}
+}
+
+/*
  * spi_transfer_one_message - Default implementation of transfer_one_message()
  *
  * This is a standard implementation of transfer_one_message() for
@@ -1614,9 +1645,18 @@ static int spi_transfer_one_message(struct spi_controller *ctlr,
 	int ret = 0;
 	struct spi_statistics __percpu *statm = ctlr->pcpu_statistics;
 	struct spi_statistics __percpu *stats = msg->spi->pcpu_statistics;
+	u64 cs_start_low_time_ns, elapsed_ns;
 
 	xfer = list_first_entry(&msg->transfers, struct spi_transfer, transfer_list);
+
+	if (0 != ctlr->device_wait_for_state(msg->spi, true)) {
+		ret = -EIO;
+		dev_err(&msg->spi->dev, "device wait for ready failed\n");
+		goto out;
+	}
+
 	spi_set_cs(msg->spi, !xfer->cs_off, false);
+	cs_start_low_time_ns = ktime_get_boottime_ns();
 
 	SPI_STATISTICS_INCREMENT_FIELD(statm, messages);
 	SPI_STATISTICS_INCREMENT_FIELD(stats, messages);
@@ -1637,6 +1677,11 @@ static int spi_transfer_one_message(struct spi_controller *ctlr,
 
 fallback_pio:
 			spi_dma_sync_for_device(ctlr, xfer);
+			if (0 != ctlr->device_wait_for_state(msg->spi, false)) {
+				ret = -EIO;
+				dev_err(&msg->spi->dev, "device wait for busy failed\n");
+				goto out;
+			}
 			ret = ctlr->transfer_one(ctlr, msg->spi, xfer);
 			if (ret < 0) {
 				spi_dma_sync_for_cpu(ctlr, xfer);
@@ -1689,11 +1734,17 @@ fallback_pio:
 					 &msg->transfers)) {
 				keep_cs = true;
 			} else {
-				if (!xfer->cs_off)
+				if (!xfer->cs_off) {
+					// Calculate time cs was low and delay if time was too short
+					elapsed_ns = ktime_get_boottime_ns() - cs_start_low_time_ns;
+					spi_ensure_minimum_cs_low_time(elapsed_ns);
 					spi_set_cs(msg->spi, false, false);
-				_spi_transfer_cs_change_delay(msg, xfer);
-				if (!list_next_entry(xfer, transfer_list)->cs_off)
+					ctlr->device_wait_for_state(msg->spi, true);
+				}
+				if (!list_next_entry(xfer, transfer_list)->cs_off) {
 					spi_set_cs(msg->spi, true, false);
+					cs_start_low_time_ns = ktime_get_boottime_ns();
+				}
 			}
 		} else if (!list_is_last(&xfer->transfer_list, &msg->transfers) &&
 			   xfer->cs_off != list_next_entry(xfer, transfer_list)->cs_off) {
@@ -1704,8 +1755,12 @@ fallback_pio:
 	}
 
 out:
-	if (ret != 0 || !keep_cs)
+	if (ret != 0 || !keep_cs) {
+		// Calculate time cs was low and delay if time was too short
+		elapsed_ns = ktime_get_boottime_ns() - cs_start_low_time_ns;
+		spi_ensure_minimum_cs_low_time(elapsed_ns);
 		spi_set_cs(msg->spi, false, false);
+	}
 
 	if (msg->status == -EINPROGRESS)
 		msg->status = ret;

@@ -1,0 +1,9 @@
+config USBH1_OC_ALERT
+    tristate "USBH1 Overcurrent GPIO Notifier"
+    depends on GPIOLIB && OF
+    default m
+    help
+      This driver logs dmesg messages when the USBH1 overcurrent GPIO
+      goes low (overcurrent detected) or high (cleared). Use this if your
+      USB power switch supports OC_N signaling but handles power switching
+      itself and if you don't want Kernel USB system turning off USB on OC

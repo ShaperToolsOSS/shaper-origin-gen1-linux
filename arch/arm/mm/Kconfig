@@ -416,7 +416,6 @@ config CPU_V7
 	select CPU_CP15_MPU if !MMU
 	select CPU_HAS_ASID if MMU
 	select CPU_PABRT_V7
-	select CPU_SPECTRE if MMU
 	select CPU_THUMB_CAPABLE
 	select CPU_TLB_V7 if MMU
 

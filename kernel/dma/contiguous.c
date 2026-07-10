@@ -75,6 +75,9 @@ static int __init early_cma(char *p)
 	if (!p) {
 		pr_err("Config string not provided\n");
 		return -EINVAL;
+	} else {
+		pr_info("shaper: config string not respected since cma configuration in kernel should not be overridden\n");
+		return 0;
 	}
 
 	size_cmdline = memparse(p, &p);

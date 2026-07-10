@@ -36,7 +36,7 @@
 		regulator-max-microvolt = <5000000>;
 	};
 
-	reg_usb_h1_vbus: regulator-usb-h1-vbud {
+	reg_usb_h1_vbus: regulator-usb-h1-vbus {
 		compatible = "regulator-fixed";
 		regulator-name = "usb_h1_vbus";
 		regulator-min-microvolt = <5000000>;
@@ -92,12 +92,11 @@
 		};
 	};
 
-	rfkill {
-		compatible = "rfkill-gpio";
-		name = "rfkill";
-		radio-type = "bluetooth";
-		shutdown-gpios = <&gpio6 18 GPIO_ACTIVE_HIGH>;
-	};
+/*
+ * rfkill block removed so the Bluetooth serdev driver can exclusively
+ * control BT_EN. The shared GPIO was causing probe failures when both
+ * rfkill and the TI Bluetooth serdev driver attempted to request it.
+ */
 };
 
 &audmux {
@@ -512,6 +511,12 @@
 	pinctrl-0 = <&pinctrl_uart2 &pinctrl_bt>;
 	uart-has-rtscts;
 	status = "okay";
+
+	bluetooth {
+		compatible = "ti,wl1831-st";
+		enable-gpios = <&gpio6 18 GPIO_ACTIVE_HIGH>;
+		max-speed = <3000000>;
+	};
 };
 
 &usbh1 {
@@ -529,11 +534,11 @@
 };
 
 &usbphy1 {
-	fsl,tx-d-cal = <0x5>;
+	fsl,tx-d-cal = <106>;
 };
 
 &usbphy2 {
-	fsl,tx-d-cal = <0x5>;
+	fsl,tx-d-cal = <106>;
 };
 
 &usdhc1 {
@@ -560,7 +565,7 @@
 	status = "okay";
 
 	wifi: wifi@2 {
-		compatible = "ti,wl1835";
+		compatible = "ti,wl1831";
 		reg = <2>;
 		interrupt-parent = <&gpio6>;
 		interrupts = <17 IRQ_TYPE_EDGE_RISING>;

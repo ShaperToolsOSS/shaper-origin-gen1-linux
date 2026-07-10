@@ -1787,7 +1787,7 @@ static int csi_registered(struct v4l2_subdev *sd)
 
 		/* init default frame interval */
 		priv->frame_interval[i].numerator = 1;
-		priv->frame_interval[i].denominator = 30;
+		priv->frame_interval[i].denominator = 100;
 	}
 
 	/* disable frame skipping */

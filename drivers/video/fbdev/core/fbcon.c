@@ -420,6 +420,9 @@ static int __init fb_console_setup(char *this_opt)
 	char *options;
 	int i, j;
 
+	fb_logo_count = 1;
+	fb_center_logo = true;
+
 	if (!this_opt || !*this_opt)
 		return 1;
 

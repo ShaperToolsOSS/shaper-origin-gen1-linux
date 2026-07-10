@@ -1,114 +1,123 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (C) 2015 Pengutronix, Steffen Trumtrar <kernel@pengutronix.de>
- * Copyright (C) 2021 Pengutronix, Ahmad Fatoum <kernel@pengutronix.de>
- * Copyright 2024 NXP
+ * Copyright (C) 2015 Pengutronix, Steffen Trumtrar <kernel@...>
+ *
+ * This program is free software; you can redistribute it and/or modify it under
+ * the terms of the GNU General Public License version 2 as published by the
+ * Free Software Foundation.
  */
 
-#define pr_fmt(fmt) "caam blob_gen: " fmt
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/evm.h>
+#include <linux/platform_device.h>
 
-#include <linux/bitfield.h>
-#include <linux/device.h>
-#include <soc/fsl/caam-blob.h>
-
-#include "compat.h"
-#include "desc_constr.h"
-#include "desc.h"
-#include "error.h"
-#include "intern.h"
-#include "jr.h"
 #include "regs.h"
+#include "compat.h"
+#include "intern.h"
+#include "desc.h"
+#include "desc_constr.h"
+#include "error.h"
+#include "jr.h"
 
-#define CAAM_BLOB_DESC_BYTES_MAX					\
-	/* Command to initialize & stating length of descriptor */	\
-	(CAAM_CMD_SZ +							\
-	/* Command to append the key-modifier + key-modifier data */	\
-	 CAAM_CMD_SZ + CAAM_BLOB_KEYMOD_LENGTH +			\
-	/* Command to include input key + pointer to the input key */	\
-	 CAAM_CMD_SZ + CAAM_PTR_SZ_MAX +				\
-	/* Command to include output key + pointer to the output key */	\
-	 CAAM_CMD_SZ + CAAM_PTR_SZ_MAX +				\
-	/* Command describing the operation to perform */		\
-	 CAAM_CMD_SZ)
-
-struct caam_blob_priv {
-	struct device jrdev;
+enum access_rights {
+	KERNEL,
+	KERNEL_EVM,
+	USERSPACE,
 };
 
-struct caam_blob_job_result {
+struct blob_priv {
+	struct device *jrdev;
+	struct device dev;
+	u32 *desc;
+	u8 __iomem *red_blob;
+	u8 __iomem *modifier;
+	u8 __iomem *output;
+	bool busy;
+	enum access_rights access;
+	unsigned int payload_size;
+	struct bin_attribute *blob;
+	struct bin_attribute *payload;
+};
+
+struct blob_job_result {
 	int err;
 	struct completion completion;
 };
 
-static void caam_blob_job_done(struct device *dev, u32 *desc, u32 err, void *context)
-{
-	struct caam_blob_job_result *res = context;
-	int ecode = 0;
+static struct platform_device *pdev;
 
-	dev_dbg(dev, "%s %d: err 0x%x\n", __func__, __LINE__, err);
+static void blob_job_done(struct device *dev, u32 *desc, u32 err, void *context)
+{
+	struct blob_job_result *res = context;
+
+#ifdef DEBUG
+	dev_err(dev, "%s %d: err 0x%x\n", __func__, __LINE__, err);
+#endif
 
 	if (err)
-		ecode = caam_jr_strstatus(dev, err);
+		caam_jr_strstatus(dev, err);
 
-	res->err = ecode;
+	res->err = err;
 
-	/*
-	 * Upon completion, desc points to a buffer containing a CAAM job
-	 * descriptor which encapsulates data into an externally-storable
-	 * blob.
-	 */
 	complete(&res->completion);
 }
 
-int caam_process_blob(struct caam_blob_priv *priv,
-		      struct caam_blob_info *info, bool encap)
+/*
+ * Upon completion, desc points to a buffer containing a CAAM job
+ * descriptor which encapsulates data into an externally-storable
+ * blob.
+ */
+#define INITIAL_DESCSZ		16
+#define BLOB_OVERHEAD		(32 + 16)
+#define KEYMOD_LENGTH		16
+#define RED_BLOB_LENGTH		64
+#define MAX_BLOB_LEN		4096
+
+/*
+ * Generate a blob with the following format:
+ * Format: Normal format (Test format only for testing)
+ * Contents: General data (aka red blob)
+ * Security State: Secure State (Non-Secure for testing)
+ * Memory Types: General memory
+ */
+static int blob_encap_blob(struct blob_priv *priv, u8 *keymod, u8 *input,
+				u8 *output, u16 length)
 {
-	const struct caam_drv_private *ctrlpriv;
-	struct caam_blob_job_result testres;
-	struct device *jrdev = &priv->jrdev;
-	dma_addr_t dma_in, dma_out;
-	int op = OP_PCLID_BLOB;
-	size_t output_len;
 	u32 *desc;
-	u32 moo;
+	struct device *jrdev = priv->jrdev;
+	dma_addr_t dma_keymod;
+	dma_addr_t dma_in;
+	dma_addr_t dma_out;
+	struct blob_job_result testres;
 	int ret;
 
-	if (info->key_mod_len > CAAM_BLOB_KEYMOD_LENGTH)
-		return -EINVAL;
-
-	if (encap) {
-		op |= OP_TYPE_ENCAP_PROTOCOL;
-		output_len = info->input_len + CAAM_BLOB_OVERHEAD;
-	} else {
-		op |= OP_TYPE_DECAP_PROTOCOL;
-		output_len = info->input_len - CAAM_BLOB_OVERHEAD;
+	desc = kmalloc(CAAM_CMD_SZ * 5 + CAAM_PTR_SZ * 5, GFP_KERNEL | GFP_DMA);
+	if (!desc) {
+		dev_err(jrdev, "unable to allocate desc\n");
+		return -ENOMEM;
 	}
 
-	desc = kzalloc(CAAM_BLOB_DESC_BYTES_MAX, GFP_KERNEL);
-	if (!desc)
-		return -ENOMEM;
-
-	dma_in = dma_map_single(jrdev, info->input, info->input_len,
-				DMA_TO_DEVICE);
-	if (dma_mapping_error(jrdev, dma_in)) {
-		dev_err(jrdev, "unable to map input DMA buffer\n");
+	dma_keymod = dma_map_single(jrdev, keymod, KEYMOD_LENGTH, DMA_TO_DEVICE);
+	if (dma_mapping_error(jrdev, dma_keymod)) {
+		dev_err(jrdev, "unable to map keymod buffer\n");
 		ret = -ENOMEM;
 		goto out_free;
 	}
 
-	dma_out = dma_map_single(jrdev, info->output, output_len,
-				 DMA_FROM_DEVICE);
+	dma_in = dma_map_single(jrdev, input, length - BLOB_OVERHEAD,
+					DMA_TO_DEVICE);
+	if (dma_mapping_error(jrdev, dma_in)) {
+		dev_err(jrdev, "unable to map keymod buffer\n");
+		ret = -ENOMEM;
+		goto out_unmap_key;
+	}
+
+	dma_out = dma_map_single(jrdev, output, length,	DMA_FROM_DEVICE);
 	if (dma_mapping_error(jrdev, dma_out)) {
 		dev_err(jrdev, "unable to map output DMA buffer\n");
 		ret = -ENOMEM;
 		goto out_unmap_in;
 	}
-
-	ctrlpriv = dev_get_drvdata(jrdev->parent);
-	moo = FIELD_GET(CSTA_MOO, rd_reg32(&ctrlpriv->jr[0]->perfmon.status));
-	if (moo != CSTA_MOO_SECURE && moo != CSTA_MOO_TRUSTED)
-		dev_warn(jrdev,
-			 "using insecure test key, enable HAB to use unique device key!\n");
 
 	/*
 	 * A data blob is encrypted using a blob key (BK); a random number.
@@ -119,74 +128,411 @@ int caam_process_blob(struct caam_blob_priv *priv,
 	 */
 
 	init_job_desc(desc, 0);
-	append_key_as_imm(desc, info->key_mod, info->key_mod_len,
-			  info->key_mod_len, CLASS_2 | KEY_DEST_CLASS_REG);
-	append_seq_in_ptr_intlen(desc, dma_in, info->input_len, 0);
-	append_seq_out_ptr_intlen(desc, dma_out, output_len, 0);
-	append_operation(desc, op);
+	/*
+	 * The key modifier can be used to differentiate specific data.
+	 * Or to prevent replay attacks.
+	 */
+	append_key(desc, dma_keymod, KEYMOD_LENGTH, CLASS_2 | KEY_DEST_CLASS_REG);
+	append_seq_in_ptr(desc, dma_in, length - BLOB_OVERHEAD, 0);
+	append_seq_out_ptr(desc, dma_out, length, 0);
+	append_operation(desc, OP_TYPE_ENCAP_PROTOCOL | OP_PCLID_BLOB);
 
-	print_hex_dump_debug("data@"__stringify(__LINE__)": ",
-			     DUMP_PREFIX_ADDRESS, 16, 1, info->input,
-			     info->input_len, false);
-	print_hex_dump_debug("jobdesc@"__stringify(__LINE__)": ",
-			     DUMP_PREFIX_ADDRESS, 16, 1, desc,
-			     desc_bytes(desc), false);
+#ifdef DEBUG
+	printk("%s: keymod %s\n", __func__, keymod);
+	print_hex_dump(KERN_ERR, "data@"__stringify(__LINE__)": ",
+			DUMP_PREFIX_ADDRESS, 16, 1, input,
+			length - BLOB_OVERHEAD, false);
+	print_hex_dump(KERN_ERR, "jobdesc@"__stringify(__LINE__)": ",
+			DUMP_PREFIX_ADDRESS, 16, 1, desc,
+			desc_bytes(desc), false);
+#endif
 
 	testres.err = 0;
 	init_completion(&testres.completion);
 
-	ret = caam_jr_enqueue(jrdev, desc, caam_blob_job_done, &testres);
+	ret = caam_jr_enqueue(jrdev, desc, blob_job_done, &testres);
 	if (ret == -EINPROGRESS) {
-		wait_for_completion(&testres.completion);
+		wait_for_completion_interruptible(&testres.completion);
 		ret = testres.err;
-		print_hex_dump_debug("output@"__stringify(__LINE__)": ",
-				     DUMP_PREFIX_ADDRESS, 16, 1, info->output,
-				     output_len, false);
+#ifdef DEBUG
+		print_hex_dump(KERN_ERR, "output@"__stringify(__LINE__)": ",
+			       DUMP_PREFIX_ADDRESS, 16, 1, output,
+			       length, false);
+#endif
 	}
 
-	if (ret == 0)
-		info->output_len = output_len;
-
-	dma_unmap_single(jrdev, dma_out, output_len, DMA_FROM_DEVICE);
+	dma_unmap_single(jrdev, dma_out, length,
+					DMA_FROM_DEVICE);
 out_unmap_in:
-	dma_unmap_single(jrdev, dma_in, info->input_len, DMA_TO_DEVICE);
+	dma_unmap_single(jrdev, dma_keymod, KEYMOD_LENGTH, DMA_TO_DEVICE);
+out_unmap_key:
+	dma_unmap_single(jrdev, dma_in, length - BLOB_OVERHEAD, DMA_TO_DEVICE);
 out_free:
 	kfree(desc);
 
 	return ret;
 }
-EXPORT_SYMBOL(caam_process_blob);
 
-struct caam_blob_priv *caam_blob_gen_init(void)
+static int blob_decap_blob(struct blob_priv *priv, u8 *keymod, u8 *input,
+				u8 *output, u16 length)
 {
-	struct caam_drv_private *ctrlpriv;
-	struct device *jrdev;
+	u32 *desc;
+	struct device *jrdev = priv->jrdev;
+	dma_addr_t dma_keymod;
+	dma_addr_t dma_in;
+	dma_addr_t dma_out;
+	struct blob_job_result testres;
+	int ret;
+
+	desc = kzalloc(CAAM_CMD_SZ * 5 + CAAM_PTR_SZ * 5, GFP_KERNEL | GFP_DMA);
+	if (!desc) {
+		dev_err(jrdev, "unable to allocate desc\n");
+		return -ENOMEM;
+	}
+
+	dma_keymod = dma_map_single(jrdev, keymod, KEYMOD_LENGTH, DMA_TO_DEVICE);
+	if (dma_mapping_error(jrdev, dma_keymod)) {
+		dev_err(jrdev, "unable to map keymod buffer\n");
+		ret = -ENOMEM;
+		goto out_free;
+	}
+
+	dma_in = dma_map_single(jrdev, input, length, DMA_TO_DEVICE);
+	if (dma_mapping_error(jrdev, dma_in)) {
+		dev_err(jrdev, "unable to map keymod buffer\n");
+		ret = -ENOMEM;
+		goto out_unmap_key;
+	}
+
+	dma_out = dma_map_single(jrdev, output, length - BLOB_OVERHEAD, DMA_FROM_DEVICE);
+	if (dma_mapping_error(jrdev, dma_out)) {
+		dev_err(jrdev, "unable to map output DMA buffer\n");
+		ret = -ENOMEM;
+		goto out_unmap_in;
+	}
 
 	/*
-	 * caam_blob_gen_init() may expectedly fail with -ENODEV, e.g. when
-	 * CAAM driver didn't probe or when SoC lacks BLOB support. An
-	 * error would be harsh in this case, so we stick to info level.
+	 * A data blob is encrypted using a blob key (BK); a random number.
+	 * The BK is used as an AES-CCM key. The initial block (B0) and the
+	 * initial counter (Ctr0) are generated automatically and stored in
+	 * Class 1 Context DWords 0+1+2+3. The random BK is stored in the
+	 * Class 1 Key Register. Operation Mode is set to AES-CCM.
 	 */
 
-	jrdev = caam_jr_alloc();
-	if (IS_ERR(jrdev)) {
-		pr_info("job ring requested, but none currently available\n");
-		return ERR_PTR(-ENODEV);
+	init_job_desc(desc, 0);
+	/*
+	 * The key modifier can be used to differentiate specific data.
+	 * Or to prevent replay attacks.
+	 */
+	append_key(desc, dma_keymod, KEYMOD_LENGTH, CLASS_2 | KEY_DEST_CLASS_REG);
+	append_seq_in_ptr_intlen(desc, dma_in, length, 0);
+	append_seq_out_ptr_intlen(desc, dma_out, length - BLOB_OVERHEAD, 0);
+	append_operation(desc, OP_TYPE_DECAP_PROTOCOL | OP_PCLID_BLOB);
+
+#ifdef DEBUG
+	print_hex_dump(KERN_ERR, "data@"__stringify(__LINE__)": ",
+			DUMP_PREFIX_ADDRESS, 16, 1, input,
+			length, false);
+	print_hex_dump(KERN_ERR, "jobdesc@"__stringify(__LINE__)": ",
+			DUMP_PREFIX_ADDRESS, 16, 1, desc,
+			desc_bytes(desc), false);
+#endif
+
+	testres.err = 0;
+	init_completion(&testres.completion);
+
+	ret = caam_jr_enqueue(jrdev, desc, blob_job_done, &testres);
+	if (ret == -EINPROGRESS) {
+		wait_for_completion_interruptible(&testres.completion);
+		ret = testres.err;
+#ifdef DEBUG
+		print_hex_dump(KERN_ERR, "output@"__stringify(__LINE__)": ",
+			       DUMP_PREFIX_ADDRESS, 16, 1, output,
+			       length - BLOB_OVERHEAD, false);
+#endif
 	}
 
-	ctrlpriv = dev_get_drvdata(jrdev->parent);
-	if (!ctrlpriv->blob_present) {
-		dev_info(jrdev, "no hardware blob generation support\n");
-		caam_jr_free(jrdev);
-		return ERR_PTR(-ENODEV);
-	}
+	dma_unmap_single(jrdev, dma_out, length - BLOB_OVERHEAD, DMA_FROM_DEVICE);
+out_unmap_in:
+	dma_unmap_single(jrdev, dma_keymod, KEYMOD_LENGTH, DMA_TO_DEVICE);
+out_unmap_key:
+	dma_unmap_single(jrdev, dma_in, length, DMA_TO_DEVICE);
+out_free:
+	kfree(desc);
 
-	return container_of(jrdev, struct caam_blob_priv, jrdev);
+	return ret;
 }
-EXPORT_SYMBOL(caam_blob_gen_init);
 
-void caam_blob_gen_exit(struct caam_blob_priv *priv)
+static ssize_t
+blob_gen_blob_read(struct file *filp, struct kobject *kobj, struct bin_attribute *attr,
+		char *buf, loff_t off, size_t size)
 {
-	caam_jr_free(&priv->jrdev);
+	struct device *dev = kobj_to_dev(kobj);
+	struct blob_priv *priv = dev_get_drvdata(dev);
+	int length = min((int)size, (int) (priv->payload_size + BLOB_OVERHEAD - off));
+	int ret;
+
+	if (length > 0) {
+		priv->busy = true;
+
+		ret = blob_encap_blob(priv, priv->modifier, priv->output, priv->red_blob, length);
+		if (ret) {
+			priv->busy = false;
+			return -EINVAL;
+		}
+
+		memcpy(buf, priv->red_blob, length);
+
+		priv->busy = false;
+	}
+
+	return length;
 }
-EXPORT_SYMBOL(caam_blob_gen_exit);
+
+static ssize_t
+blob_gen_blob_write(struct file *filp, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t off, size_t size)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct blob_priv *priv = dev_get_drvdata(dev);
+	int ret;
+
+	if (size > 0) {
+		priv->busy = true;
+
+		memcpy(priv->red_blob, buf, size);
+
+		memset(priv->output, 0, MAX_BLOB_LEN - BLOB_OVERHEAD);
+
+		ret = blob_decap_blob(priv, priv->modifier, priv->red_blob,
+					priv->output, size);
+		if (ret) {
+			priv->busy = false;
+			return -EINVAL;
+		}
+
+		priv->payload_size = size - BLOB_OVERHEAD;
+
+		priv->busy = false;
+	}
+
+	return size;
+}
+
+static ssize_t
+blob_gen_payload_read(struct file *filp, struct kobject *kobj,
+			struct bin_attribute *attr, char *buf, loff_t off,
+			size_t size)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct blob_priv *priv = dev_get_drvdata(dev);
+	int length = min((int) size, (int) (priv->payload_size - off));
+
+	if (priv->payload_size == 0)
+		return -EINVAL;
+
+	if (priv->access != USERSPACE)
+		return -EPERM;
+
+	memcpy(buf, priv->output + off, length);
+
+	return length;
+}
+
+static ssize_t
+blob_gen_payload_write(struct file *filp, struct kobject *kobj,
+			struct bin_attribute *attr, char *buf, loff_t off,
+			size_t size)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct blob_priv *priv = dev_get_drvdata(dev);
+
+	if (priv->busy)
+		return -EPERM;
+
+	memcpy(priv->output, buf, size);
+
+	priv->payload_size = size;
+
+	return size;
+}
+
+static ssize_t
+blob_gen_show_modifier(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct blob_priv *priv = dev_get_drvdata(dev);
+
+	memcpy(buf, priv->modifier, KEYMOD_LENGTH);
+
+	return KEYMOD_LENGTH;
+}
+
+static ssize_t
+blob_gen_set_modifier(struct device *dev, struct device_attribute *attr,
+			const char *buf, size_t n)
+{
+	struct blob_priv *priv = dev_get_drvdata(dev);
+	char *buf_ptr;
+
+	if (n > KEYMOD_LENGTH)
+		return -EINVAL;
+
+	if (priv->busy)
+		return -EPERM;
+
+	buf_ptr = (char *)buf;
+	if (!strncmp(buf_ptr, "kernel:evm", 10))
+		priv->access = KERNEL_EVM;
+	else if (!strncmp(buf_ptr, "kernel:", 7))
+		priv->access = KERNEL;
+	else
+		priv->access = USERSPACE;
+
+	memset(priv->output, 0, MAX_BLOB_LEN - BLOB_OVERHEAD);
+	memset(priv->red_blob, 0, MAX_BLOB_LEN);
+
+	memset(priv->modifier, 0, KEYMOD_LENGTH);
+
+	if (n > 1)
+		memcpy(priv->modifier, buf, n);
+	else
+		pr_info("refusing to set single character modifier which is probably an unintended newline\n");
+
+	return n;
+}
+static DEVICE_ATTR(modifier, S_IRUSR | S_IWUSR,
+		blob_gen_show_modifier, blob_gen_set_modifier);
+
+static struct attribute *blob_attrs[] = {
+	&dev_attr_modifier.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(blob);
+
+static int __init blob_gen_init(void)
+{
+	struct device_node *dev_node;
+	struct device *ctrldev;
+	struct caam_drv_private *ctrlpriv;
+	struct blob_priv *priv;
+	int ret;
+
+	dev_node = of_find_compatible_node(NULL, NULL, "fsl,sec-v4.0");
+	if (!dev_node) {
+		dev_node = of_find_compatible_node(NULL, NULL, "fsl,sec4.0");
+		if (!dev_node)
+			return -ENODEV;
+	}
+
+	pdev = of_find_device_by_node(dev_node);
+	if (!pdev) {
+		of_node_put(dev_node);
+		return -ENODEV;
+	}
+
+	ctrldev = &pdev->dev;
+
+	pdev = platform_device_alloc("blob_gen", -1);
+	if (!pdev)
+		return -ENOMEM;
+
+	pdev->dev.parent = ctrldev;
+	pdev->dev.groups = blob_groups;
+
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+	priv->jrdev = caam_jr_alloc();
+        if (IS_ERR(priv->jrdev)) {
+                pr_info("job ring requested, but none currently available\n");
+                return -ENODEV;
+        }
+
+	ctrlpriv = dev_get_drvdata(priv->jrdev->parent);
+	if (!ctrlpriv->blob_present) {
+		dev_info(priv->jrdev, "no hardware blob generation support\n");
+		caam_jr_free(priv->jrdev);
+		return -ENODEV;
+	}
+
+	priv->blob = devm_kzalloc(&pdev->dev, sizeof(struct bin_attribute),
+					GFP_KERNEL);
+	priv->payload = devm_kzalloc(&pdev->dev, sizeof(struct bin_attribute),
+					GFP_KERNEL);
+
+	ret = platform_device_add(pdev);
+	if (ret)
+		goto pdev_add_failed;
+
+	priv->modifier = devm_kzalloc(&pdev->dev, sizeof(*priv->modifier)*KEYMOD_LENGTH,
+			GFP_KERNEL | GFP_DMA);
+
+	priv->red_blob = devm_kzalloc(&pdev->dev, sizeof(*priv->red_blob)*
+					MAX_BLOB_LEN, GFP_KERNEL | GFP_DMA);
+
+	priv->output = devm_kzalloc(&pdev->dev, sizeof(*priv->output)*
+					MAX_BLOB_LEN - BLOB_OVERHEAD, GFP_KERNEL | GFP_DMA);
+
+	priv->desc = devm_kzalloc(&pdev->dev, sizeof(*priv->desc), GFP_KERNEL | GFP_DMA);
+	if (priv->desc == NULL)
+		return -ENOMEM;
+
+	dev_set_drvdata(&pdev->dev, priv);
+
+	priv->busy = false;
+
+	priv->blob->attr.name = "blob";
+	priv->blob->attr.mode = S_IRUSR | S_IWUSR;
+
+	sysfs_bin_attr_init(priv->blob);
+	priv->blob->read = blob_gen_blob_read;
+	priv->blob->write = blob_gen_blob_write;
+
+	ret = sysfs_create_bin_file(&pdev->dev.kobj, priv->blob);
+	if (ret)
+		dev_err(&pdev->dev, "unable to create sysfs file %s\n",
+			priv->blob->attr.name);
+	else
+		dev_info(&pdev->dev, "added sysfs binary attribute\n");
+
+	priv->payload->attr.name = "payload";
+	priv->payload->attr.mode = S_IRUSR | S_IWUSR;
+
+	sysfs_bin_attr_init(priv->payload);
+	priv->payload->read = blob_gen_payload_read;
+	priv->payload->write = blob_gen_payload_write;
+
+	ret = sysfs_create_bin_file(&pdev->dev.kobj, priv->payload);
+	if (ret)
+		dev_err(&pdev->dev, "unable to create sysfs file %s\n",
+			priv->payload->attr.name);
+	else
+		dev_info(&pdev->dev, "added sysfs binary attribute\n");
+
+	return 0;
+
+pdev_add_failed:
+	platform_device_put(pdev);
+
+	return ret;
+}
+
+static void __exit blob_gen_exit(void)
+{
+	struct blob_priv *priv;
+
+	priv = dev_get_drvdata(&pdev->dev);
+	if (!priv)
+		return;
+
+	sysfs_remove_bin_file(&pdev->dev.kobj, priv->payload);
+	sysfs_remove_bin_file(&pdev->dev.kobj, priv->blob);
+
+	platform_device_unregister(pdev);
+}
+
+module_init(blob_gen_init);
+module_exit(blob_gen_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Blob Generator Example");
+MODULE_AUTHOR("Steffen Trumtrar <s.trumtrar@...>");
